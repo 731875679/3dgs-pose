@@ -16,6 +16,67 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.general_utils import PILtoTorch
 import cv2
 
+def V(theta):
+    dtype = theta.dtype
+    device = theta.device
+    I = torch.eye(3, device=device, dtype=dtype)
+    W = skew_sym_mat(theta)
+    W2 = W @ W
+    angle = torch.norm(theta)
+    if angle < 1e-5:
+        V = I + 0.5 * W + (1.0 / 6.0) * W2
+    else:
+        V = (
+            I
+            + W * ((1.0 - torch.cos(angle)) / (angle**2))
+            + W2 * ((angle - torch.sin(angle)) / (angle**3))
+        )
+    return V
+
+def SE3_exp(tau):
+    dtype = tau.dtype
+    device = tau.device
+
+    rho = tau[:3]
+    theta = tau[3:]
+    R = SO3_exp(theta)
+    t = V(theta) @ rho
+
+    T = torch.eye(4, device=device, dtype=dtype)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+def skew_sym_mat(x):
+    device = x.device
+    dtype = x.dtype
+    ssm = torch.zeros(3, 3, device=device, dtype=dtype)
+    ssm[0, 1] = -x[2]
+    ssm[0, 2] = x[1]
+    ssm[1, 0] = x[2]
+    ssm[1, 2] = -x[0]
+    ssm[2, 0] = -x[1]
+    ssm[2, 1] = x[0]
+    return ssm
+
+
+def SO3_exp(theta):
+    device = theta.device
+    dtype = theta.dtype
+
+    W = skew_sym_mat(theta)
+    W2 = W @ W
+    angle = torch.norm(theta)
+    I = torch.eye(3, device=device, dtype=dtype)
+    if angle < 1e-5:
+        return I + W + 0.5 * W2
+    else:
+        return (
+            I
+            + (torch.sin(angle) / angle) * W
+            + ((1 - torch.cos(angle)) / (angle**2)) * W2
+        )
+        
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
@@ -87,6 +148,70 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+        
+        # add the pose deltas for optimization 
+        self.cam_rot_delta = nn.Parameter(
+            torch.zeros(3, requires_grad=True, device=data_device)
+        )
+        self.cam_trans_delta = nn.Parameter(
+            torch.zeros(3, requires_grad=True, device=data_device)
+        )
+
+        self.exposure_a = nn.Parameter(
+            torch.tensor([0.0], requires_grad=True, device=data_device)
+        )
+        self.exposure_b = nn.Parameter(
+            torch.tensor([0.0], requires_grad=True, device=data_device)
+        )
+        
+        self.camera_optimizer = None
+        self.training_setup()
+
+    def update_RT(self, R, t):
+        
+        self.R = R.to(device=self.data_device)
+        self.T = t.to(device=self.data_device)
+        
+    def training_setup(self):
+        opt_params = []
+        opt_params.append(
+            {
+                "params": [self.cam_rot_delta],
+                "lr": 0.0015,
+                "name": "rot_{}".format(self.uid),
+            }
+        )
+        opt_params.append(
+            {
+                "params": [self.cam_trans_delta],
+                "lr": 0.0005,
+                "name": "trans_{}".format(self.uid),
+            }
+        )
+        opt_params.append(
+            {
+                "params": [self.exposure_a],
+                "lr": 0.01,
+                "name": "exposure_a_{}".format(self.uid),
+            }
+        )
+        opt_params.append(
+            {
+                "params": [self.exposure_b],
+                "lr": 0.01,
+                "name": "exposure_b_{}".format(self.uid),
+            }
+        )
+        self.camera_optimizer = torch.optim.Adam(opt_params)    
+        return self.camera_optimizer
+    
+    def clean(self):
+
+        self.cam_rot_delta = None
+        self.cam_trans_delta = None
+
+        self.exposure_a = None
+        self.exposure_b = None
         
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

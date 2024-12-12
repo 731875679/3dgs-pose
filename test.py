@@ -10,8 +10,6 @@
 #
 
 import os
-
-from matplotlib import pyplot as plt
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -25,6 +23,8 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.camera_utils import update_pose
+import cv2
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -42,6 +42,19 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+def downsample_image(image, num_levels=2):
+    """
+    使用高斯金字塔方法将图像的分辨率降低。
+    image: 输入图像 (torch tensor, 形状为 [C, H, W])
+    num_levels: 高斯金字塔的层数，这里我们只关心降采样两次
+    """
+    for _ in range(num_levels):
+        # 使用 bilinear 插值进行下采样
+        image = F.interpolate(image.unsqueeze(0), scale_factor=0.5, mode='bilinear', align_corners=False).squeeze(0)
+    return image
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -70,23 +83,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    first_iter += 1
     
     # 初始化实时绘图
     plt.ion()
     fig, ax = plt.subplots()
     loss_values = []
     global_iterations = []
-    line, = ax.plot([], [], label="Loss")
-    ax.set_title("Real-time Loss Visualization")
-    ax.set_xlabel("Global Iteration")
-    ax.set_ylabel("Loss")
-    ax.legend()
 
     global_iteration = 0  # 全局计数器
     
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-    first_iter += 1
-    opt.iterations =30000
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -107,24 +115,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
-
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
+            
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
-
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-
+        
+        # Every 1000 its we increase the levels of SH up to a maximum degree
+        if global_iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
+            
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         (
             image,
@@ -150,78 +158,60 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+    
+        # 将图像分辨率降低
+        # gt_image_downsampled = downsample_image(gt_image, num_levels=2)
+        # image_downsampled = downsample_image(image, num_levels=2)
+        
+        gt_image_downsampled = gt_image
+        image_downsampled = image        
+        Ll1 = l1_loss(image_downsampled, gt_image_downsampled)
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            ssim_value = fused_ssim(image_downsampled.unsqueeze(0), gt_image_downsampled.unsqueeze(0))
         else:
-            ssim_value = ssim(image, gt_image)
+            ssim_value = ssim(image_downsampled, gt_image_downsampled)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
-
         loss.backward()
-
-        iter_end.record()
         
+        # # 记录大于 2500 次后的最小 loss
+        # if iteration > 2500 and loss.item() < min_loss:
+        #     min_loss = loss.item()
+        #     min_loss_iteration = iteration
+
+        #     # 打印输出当前最优结果
+        #     print(f"New minimum loss: {min_loss:.7f} at iteration {min_loss_iteration}")
         with torch.no_grad():
-            global_iteration += 1  # 增加全局计数
             global_iterations.append(global_iteration)
             loss_values.append(loss.item())
-            line.set_xdata(global_iterations)
-            line.set_ydata(loss_values)
-            ax.relim()
-            ax.autoscale_view()
-            plt.draw()
-            plt.pause(0.01)
+            
+        # with torch.no_grad():
+        #     global_iterations.append(global_iteration)
+        #     loss_values.append(loss.item())
+        #     line.set_xdata(global_iterations)
+        #     line.set_ydata(loss_values)
+        #     ax.relim()
+        #     ax.autoscale_view()
+            # plt.draw()
+            # plt.pause(0.01)
             
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
-
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-
+            global_iteration += 1  # 增加全局计数
             # Densification
-            if iteration < opt.densify_until_iter:
+            if global_iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                if global_iteration > opt.densify_from_iter and global_iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if global_iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if global_iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and global_iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
-                    
-            pose_optimizer = viewpoint_cam.training_setup()
-            pose_optimizer.zero_grad()
             
             # Optimizer step
-            if iteration < opt.iterations:
+            if global_iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
@@ -232,19 +222,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
                     
-            viewpoint_cam.camera_optimizer.step()
-            converged = update_pose(viewpoint_cam)
-            # if converged:
-            #     break
+            if iteration > 7000:
+                pose_optimizer = viewpoint_cam.training_setup()
+                pose_optimizer.zero_grad(set_to_none = True)        
+                with torch.no_grad():
+                    viewpoint_cam.camera_optimizer.step()
+                    converged = update_pose(viewpoint_cam)
+                # if converged:
+                #     break      
+                                      
+        if (iteration in checkpoint_iterations):
+            print("\n[ITER {}] Saving Checkpoint".format(iteration))
+            torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
             
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                
-    # # 保存损失图表
-    # plt.ioff()
-    # plt.savefig("loss_curve_colmap.png")          
+        with torch.no_grad():
+            # Progress bar
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
+            if global_iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
+            if iteration == opt.iterations:
+                progress_bar.close()    
+                    
+        # Log and save
+        iter_end.record()  # 记录结束时间
+        torch.cuda.synchronize()  # 确保所有CUDA操作完成
+        training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+        if (iteration in saving_iterations):
+            print("\n[ITER {}] Saving Gaussians".format(iteration))
+            scene.save(iteration)        
+            
+    plt.figure()
+    plt.plot(global_iterations, loss_values, label="Loss")
+    plt.title("Loss Curve")
+    plt.xlabel("Global Iteration")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("loss_curve_pose.png")
+    plt.close()
+    
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -288,8 +306,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
+                                {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -332,11 +349,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(f"{config['name']}/loss_viewpoint - ssim", metrics['ssim'], iteration)
                     tb_writer.add_scalar(f"{config['name']}/loss_viewpoint - lpips", metrics['lpips'], iteration)
 
-    # 可选：添加透明度和点数量的直方图
-    if tb_writer:
-        tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-        tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-    torch.cuda.empty_cache()
+        # 可选：添加透明度和点数量的直方图
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -348,8 +365,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 30000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 30000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000,15000,30000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000,15000,30000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
